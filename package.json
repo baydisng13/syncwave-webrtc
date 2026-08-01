@@ -1,0 +1,17 @@
+{
+  "name": "syncwave",
+  "version": "1.0.0",
+  "private": true,
+  "packageManager": "pnpm@9.12.0",
+  "scripts": {
+    "build:shared": "pnpm --filter @syncwave/shared build",
+    "dev": "pnpm build:shared && concurrently -n server,web -c blue,magenta \"pnpm --filter @syncwave/server dev\" \"pnpm --filter @syncwave/web dev\"",
+    "dev:server": "pnpm --filter @syncwave/server dev",
+    "dev:web": "pnpm --filter @syncwave/web dev",
+    "build": "pnpm -r build",
+    "typecheck": "pnpm -r typecheck"
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.0"
+  }
+}
