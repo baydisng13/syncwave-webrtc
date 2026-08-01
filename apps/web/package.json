@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "vite dev --port 3000",
-    "build": "vite build",
+    "build": "tsc -p ../../packages/shared/tsconfig.json && vite build",
     "start": "node .output/server/index.mjs",
     "typecheck": "tsc --noEmit"
   },
