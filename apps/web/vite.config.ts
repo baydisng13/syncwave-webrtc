@@ -11,9 +11,11 @@ export default defineConfig({
   },
   plugins: [
     tailwindcss(),
-    // TanStack Start (file-based routing). Signaling now lives in the NestJS
-    // server, so there are no server functions here — client + SSR shell only.
-    tanstackStart(),
+    // TanStack Start in SPA mode: the whole app is client-driven (all WebRTC
+    // runs in the browser; signaling lives in the NestJS server), so we ship a
+    // prerendered shell + static client bundle. No server adapter needed —
+    // deploys to any static host (Vercel) with a catch-all rewrite to the shell.
+    tanstackStart({ spa: { enabled: true } }),
     viteReact(),
   ],
 })
