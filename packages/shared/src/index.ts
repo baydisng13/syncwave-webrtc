@@ -43,5 +43,13 @@ export type SyncMessage =
   | { type: 'pause'; time: number; at: number }
   | { type: 'seek'; time: number; paused: boolean; at: number }
   | { type: 'rate'; rate: number; at: number }
+  /**
+   * Clock-sync probe (viewer → host). `t0` is the viewer's performance.now()
+   * at send. Used to estimate RTT + host-clock offset so the viewer can
+   * compensate for one-way latency instead of starting playback stale.
+   */
+  | { type: 'ping'; t0: number }
+  /** Clock-sync reply (host → viewer). Echoes `t0`, adds host Date.now(). */
+  | { type: 'pong'; t0: number; hostAt: number }
 
 export type Role = 'host' | 'viewer'

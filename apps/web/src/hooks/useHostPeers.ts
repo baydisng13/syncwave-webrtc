@@ -141,6 +141,19 @@ export function useHostPeers(
       }
       dc.onclose = syncStates
 
+      // Answer viewer clock-sync probes so they can compensate for one-way
+      // latency. Reply carries the host wall-clock at reply time.
+      dc.onmessage = (e) => {
+        try {
+          const m = JSON.parse(e.data as string) as SyncMessage
+          if (m.type === 'ping') {
+            dc.send(JSON.stringify({ type: 'pong', t0: m.t0, hostAt: Date.now() }))
+          }
+        } catch {
+          /* ignore malformed */
+        }
+      }
+
       pc.onicecandidate = (e) => {
         if (e.candidate) send(viewerId, 'ice', e.candidate.toJSON())
       }
