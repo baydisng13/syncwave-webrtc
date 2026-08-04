@@ -25,7 +25,8 @@ interface HostSnapshot {
   time: number
   paused: boolean
   rate: number
-  localAt: number // performance.now() at receipt
+  hostAt: number // host Date.now() when the msg was sent (for latency comp.)
+  localAt: number // performance.now() at receipt (fallback pre-clock-sync)
 }
 
 /**
@@ -60,18 +61,35 @@ export function useViewerPeer(
   const pendingIce = useRef<RTCIceCandidateInit[]>([])
   const lastHost = useRef<HostSnapshot | null>(null)
   const sendRef = useRef<ReturnType<typeof useSocket>['send']>(() => {})
+  const dcRef = useRef<RTCDataChannel | null>(null)
+  // performance.now() + clockOffset ≈ host Date.now(). null until first pong.
+  const clockOffset = useRef<number | null>(null)
+  const bestRtt = useRef<number>(Infinity)
 
   // --- video reconciliation -------------------------------------------------
-  const reconcile = useCallback(() => {
+  // Where the host is *right now*. When clock-sync has landed we anchor to the
+  // host's own send timestamp (msg.at) + estimated one-way latency, so we place
+  // playback where the host actually is — not where it was when the packet
+  // left. Pre-sync we fall back to "elapsed since receipt".
+  const expectedTime = (h: HostSnapshot): number => {
+    if (h.paused) return h.time
+    const elapsedMs =
+      clockOffset.current != null
+        ? performance.now() + clockOffset.current - h.hostAt
+        : performance.now() - h.localAt
+    return h.time + (Math.max(0, elapsedMs) / 1000) * h.rate
+  }
+
+  // `hard` = snap currentTime exactly (user actions: play/pause/seek). Soft
+  // reconcile only corrects when drift exceeds tolerance, so the periodic loop
+  // and heartbeat don't fight normal decode jitter.
+  const reconcile = useCallback((hard = false) => {
     const v = videoRef.current
     const h = lastHost.current
     if (!v || !h) return
 
-    const expected = h.paused
-      ? h.time
-      : h.time + ((performance.now() - h.localAt) / 1000) * h.rate
-
-    if (Math.abs(v.currentTime - expected) > DRIFT_TOLERANCE) {
+    const expected = expectedTime(h)
+    if (hard || Math.abs(v.currentTime - expected) > DRIFT_TOLERANCE) {
       v.currentTime = expected
     }
     if (v.playbackRate !== h.rate) v.playbackRate = h.rate
@@ -88,34 +106,69 @@ export function useViewerPeer(
   const applySync = useCallback(
     (msg: SyncMessage) => {
       const now = performance.now()
+      // `hard` snaps currentTime exactly — reserved for host user actions.
+      let hard = false
       switch (msg.type) {
         case 'source':
           setSourceUrl(msg.url)
           return
+        case 'pong': {
+          // Clock-sync: keep the min-RTT sample. hostClock@receipt ≈ hostAt +
+          // rtt/2, so offset maps performance.now() → host Date.now().
+          const rtt = now - msg.t0
+          if (rtt < bestRtt.current) {
+            bestRtt.current = rtt
+            clockOffset.current = msg.hostAt + rtt / 2 - now
+          }
+          return
+        }
+        case 'ping':
+          return // viewer never receives these
         case 'state':
-          lastHost.current = { time: msg.time, paused: msg.paused, rate: msg.rate, localAt: now }
+          lastHost.current = { time: msg.time, paused: msg.paused, rate: msg.rate, hostAt: msg.at, localAt: now }
           break
         case 'play':
-          lastHost.current = { time: msg.time, paused: false, rate: msg.rate, localAt: now }
+          hard = true
+          lastHost.current = { time: msg.time, paused: false, rate: msg.rate, hostAt: msg.at, localAt: now }
           break
         case 'pause':
-          lastHost.current = { time: msg.time, paused: true, rate: lastHost.current?.rate ?? 1, localAt: now }
+          hard = true
+          lastHost.current = { time: msg.time, paused: true, rate: lastHost.current?.rate ?? 1, hostAt: msg.at, localAt: now }
           break
         case 'seek':
-          lastHost.current = { time: msg.time, paused: msg.paused, rate: lastHost.current?.rate ?? 1, localAt: now }
+          hard = true
+          lastHost.current = { time: msg.time, paused: msg.paused, rate: lastHost.current?.rate ?? 1, hostAt: msg.at, localAt: now }
           break
         case 'rate':
-          if (lastHost.current) lastHost.current = { ...lastHost.current, rate: msg.rate, localAt: now }
+          if (lastHost.current) lastHost.current = { ...lastHost.current, rate: msg.rate, hostAt: msg.at, localAt: now }
           break
       }
-      reconcile()
+      reconcile(hard)
       setStatus((s) => (s === 'connecting' || s === 'reconnecting' ? 'connected' : s))
     },
     [reconcile],
   )
 
+  // Fire a short burst of clock-sync probes, keeping the min-RTT estimate.
+  const syncClock = useCallback(() => {
+    let n = 0
+    const ping = () => {
+      const dc = dcRef.current
+      if (!dc || dc.readyState !== 'open') return
+      try {
+        dc.send(JSON.stringify({ type: 'ping', t0: performance.now() } satisfies SyncMessage))
+      } catch {
+        return
+      }
+      if (++n < 5) setTimeout(ping, 300)
+    }
+    ping()
+  }, [])
+
   const wireChannel = useCallback(
     (dc: RTCDataChannel) => {
+      dcRef.current = dc
+      bestRtt.current = Infinity // re-measure fresh network on each channel
       dc.onmessage = (e) => {
         try {
           applySync(JSON.parse(e.data as string) as SyncMessage)
@@ -123,8 +176,10 @@ export function useViewerPeer(
           /* ignore malformed */
         }
       }
+      if (dc.readyState === 'open') syncClock()
+      else dc.onopen = syncClock
     },
-    [applySync],
+    [applySync, syncClock],
   )
 
   // --- signaling ------------------------------------------------------------
@@ -222,6 +277,7 @@ export function useViewerPeer(
     const v = videoRef.current
     if (!v) return
     const loop = setInterval(reconcile, 500)
+    const resync = setInterval(syncClock, 15000) // track clock drift over time
     const onWaiting = () => setStatus('buffering')
     const onPlaying = () => {
       reconcile()
@@ -231,10 +287,11 @@ export function useViewerPeer(
     v.addEventListener('playing', onPlaying)
     return () => {
       clearInterval(loop)
+      clearInterval(resync)
       v.removeEventListener('waiting', onWaiting)
       v.removeEventListener('playing', onPlaying)
     }
-  }, [videoRef, reconcile])
+  }, [videoRef, reconcile, syncClock])
 
   // Say goodbye + tear down.
   useEffect(() => {
